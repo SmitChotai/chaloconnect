@@ -1,0 +1,754 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full bg-gray-50">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chalo Connect - Local Booking Service</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Firebase 11.6.1 SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { 
+            getAuth, 
+            signInAnonymously, 
+            signInWithCustomToken, 
+            onAuthStateChanged 
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { 
+            getFirestore, 
+            doc, 
+            getDoc, 
+            addDoc, 
+            updateDoc, 
+            collection, 
+            query, 
+            where, 
+            onSnapshot, 
+            Timestamp,
+            setLogLevel
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- GLOBAL STATE ---
+        let db;
+        let auth;
+        let userId;
+        // Use __app_id if available, otherwise a default for testing
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'chalo-connect-default';
+        
+        let currentView = 'passenger'; // 'passenger' or 'driver'
+        let allTripsListener = null;
+        let myTripsListener = null;
+        let myBookingsListener = null;
+        
+        // --- CITIES & VEHICLES (Constants) ---
+        const CITIES = ["Ahmedabad", "Vadodara", "Bharuch", "Dahej"];
+        const VEHICLES = ["Eeco", "Van", "Ertiga", "Other"];
+
+        // --- DOM Elements ---
+        // Will be assigned in window.onload
+        let passengerView, driverView, loadingSpinner, authStatus, userIdDisplay;
+        let postRideModal, bookRideModal, viewBookingsModal;
+        let allTripsContainer, myTripsContainer, viewBookingsList;
+
+        // --- FIREBASE INITIALIZATION ---
+        async function initFirebase() {
+            try {
+                // Get Firebase config from global var
+                // const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+                
+                // --- YOUR FIREBASE CONFIG ---
+                const firebaseConfig = {
+                  apiKey: "AIzaSyAsS8nLvi5WJJHv8LmRomO4StBb7Hq8xk4",
+                  authDomain: "cpd-anytime.firebaseapp.com",
+                  projectId: "cpd-anytime",
+                  storageBucket: "cpd-anytime.appspot.com",
+                  messagingSenderId: "221514305010",
+                  appId: "1:221514305010:web:fe079e7a6e59218e4daf6b",
+                  measurementId: "G-CCM2M1JZXE"
+                };
+                // --- END OF YOUR FIREBASE CONFIG ---
+                
+                if (!firebaseConfig.apiKey) {
+                    console.error("Firebase config is missing.");
+                    authStatus.textContent = "Error: App is not configured.";
+                    loadingSpinner.classList.add('hidden');
+                    return;
+                }
+
+                setLogLevel('Debug'); // Enable detailed Firestore logs
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                // Auth state listener
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        console.log("User signed in:", userId);
+                        userIdDisplay.textContent = `Your User ID: ${userId}`;
+                        authStatus.textContent = "Connected";
+                        authStatus.classList.remove('text-yellow-500');
+                        authStatus.classList.add('text-green-500');
+                        
+                        // User is ready, load the default view's data
+                        updateView();
+                    } else {
+                        userId = null;
+                        console.log("User signed out.");
+                        userIdDisplay.textContent = "Your User ID: (Signing in...)";
+                        authStatus.textContent = "Connecting...";
+                        authStatus.classList.add('text-yellow-500');
+                    }
+                    loadingSpinner.classList.add('hidden');
+                });
+
+                // Sign in
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+            } catch (error) {
+                console.error("Firebase Init Error:", error);
+                authStatus.textContent = "Error loading app.";
+                loadingSpinner.classList.add('hidden');
+            }
+        }
+
+        // --- DATA PATHS ---
+        // All trips are public
+        const getTripsCollection = () => collection(db, `/artifacts/${appId}/public/data/trips`);
+        // All bookings are also public (for this simple app)
+        const getBookingsCollection = () => collection(db, `/artifacts/${appId}/public/data/bookings`);
+
+        // --- VIEW MANAGEMENT ---
+        function toggleView(view) {
+            if (!userId) return; // Don't do anything if auth isn't ready
+            currentView = view;
+            
+            // Toggle active tab
+            document.getElementById('passenger-tab').classList.toggle('bg-blue-600', view === 'passenger');
+            document.getElementById('passenger-tab').classList.toggle('text-white', view === 'passenger');
+            document.getElementById('passenger-tab').classList.toggle('bg-white', view !== 'passenger');
+            
+            document.getElementById('driver-tab').classList.toggle('bg-blue-600', view === 'driver');
+            document.getElementById('driver-tab').classList.toggle('text-white', view === 'driver');
+            document.getElementById('driver-tab').classList.toggle('bg-white', view !== 'driver');
+            
+            // Toggle view panels
+            passengerView.classList.toggle('hidden', view !== 'passenger');
+            driverView.classList.toggle('hidden', view === 'passenger');
+            
+            updateView();
+        }
+
+        function updateView() {
+            if (!userId) return; // Wait for auth
+            
+            // Detach previous listeners to avoid duplicates
+            if (allTripsListener) allTripsListener();
+            if (myTripsListener) myTripsListener();
+
+            if (currentView === 'passenger') {
+                listenForAllTrips();
+            } else {
+                listenForMyTrips();
+            }
+        }
+
+        // --- PASSENGER FUNCTIONS ---
+        function listenForAllTrips() {
+            console.log("Listening for all trips...");
+            allTripsContainer.innerHTML = '<p class="text-gray-500">Loading available rides...</p>';
+            
+            // Query for trips that are scheduled and in the future
+            const q = query(
+                getTripsCollection(),
+                where("status", "==", "Scheduled"),
+                where("departureTime", ">", Timestamp.now())
+            );
+
+            allTripsListener = onSnapshot(q, (snapshot) => {
+                if (snapshot.empty) {
+                    allTripsContainer.innerHTML = '<p class="text-gray-500">No rides available right now. Check back soon!</p>';
+                    return;
+                }
+
+                let trips = [];
+                snapshot.forEach(doc => {
+                    trips.push({ id: doc.id, ...doc.data() });
+                });
+                
+                // Sort by departure time (earliest first)
+                trips.sort((a, b) => a.departureTime.seconds - b.departureTime.seconds);
+
+                renderAllTrips(trips);
+            }, (error) => {
+                console.error("Error listening for trips:", error);
+                allTripsContainer.innerHTML = '<p class="text-red-500">Error loading rides.</p>';
+            });
+        }
+        
+        function renderAllTrips(trips) {
+            allTripsContainer.innerHTML = ''; // Clear previous
+            trips.forEach(trip => {
+                // Don't show full trips
+                if (trip.availableSeats <= 0) return;
+
+                const tripCard = document.createElement('div');
+                tripCard.className = "bg-white shadow-md rounded-lg p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between space-y-3 sm:space-y-0";
+                
+                const departure = trip.departureTime.toDate();
+                const timeString = departure.toLocaleDateString() + ' @ ' + departure.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+                tripCard.innerHTML = `
+                    <div class="flex-1">
+                        <div class="flex items-center space-x-3">
+                            <span class="font-bold text-lg text-blue-600">${trip.origin}</span>
+                            <span class="text-gray-500">&rarr;</span>
+                            <span class="font-bold text-lg text-blue-600">${trip.destination}</span>
+                        </div>
+                        <p class="text-sm text-gray-600">
+                            ${trip.vehicleType} with ${trip.driverName}
+                        </p>
+                        <p class="text-sm text-gray-800 font-medium">${timeString}</p>
+                    </div>
+                    <div class="flex sm:flex-col sm:items-end sm:text-right">
+                        <div class="flex-1 sm:flex-none">
+                            <p class="text-xl font-bold text-green-600">${trip.availableSeats} <span class="text-sm font-normal text-gray-600">seats left</span></p>
+                            <p class="text-md font-semibold">₹${trip.pricePerSeat} <span class="text-sm font-normal text-gray-600">per seat</span></p>
+                        </div>
+                        <button data-trip-id="${trip.id}" data-max-seats="${trip.availableSeats}" class="book-ride-btn ml-4 sm:ml-0 sm:mt-2 w-full sm:w-auto px-4 py-2 bg-green-500 text-white rounded-lg shadow hover:bg-green-600 transition duration-150">
+                            Book
+                        </button>
+                    </div>
+                `;
+                allTripsContainer.appendChild(tripCard);
+            });
+
+            // Add event listeners to new buttons
+            allTripsContainer.querySelectorAll('.book-ride-btn').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    const tripId = e.currentTarget.dataset.tripId;
+                    const maxSeats = e.currentTarget.dataset.maxSeats;
+                    showBookRideModal(tripId, maxSeats);
+                });
+            });
+        }
+        
+        function showBookRideModal(tripId, maxSeats) {
+            // Set data attributes for the form
+            const form = document.getElementById('book-ride-form');
+            form.dataset.tripId = tripId;
+            form.dataset.maxSeats = maxSeats;
+            
+            // Configure seat selector
+            const seatsInput = document.getElementById('book-seats');
+            seatsInput.max = maxSeats;
+            seatsInput.value = 1;
+            
+            // Show modal
+            bookRideModal.classList.remove('hidden');
+        }
+        
+        async function handleBookRide(e) {
+            e.preventDefault();
+            if (!userId) return;
+
+            const form = e.target;
+            const tripId = form.dataset.tripId;
+            const maxSeats = parseInt(form.dataset.maxSeats, 10);
+            const passengerName = document.getElementById('book-name').value;
+            const seatsToBook = parseInt(document.getElementById('book-seats').value, 10);
+            
+            if (!passengerName || seatsToBook <= 0) {
+                alert("Please enter your name and select at least 1 seat.");
+                return;
+            }
+            if (seatsToBook > maxSeats) {
+                alert(`Only ${maxSeats} seats are available.`);
+                return;
+            }
+            
+            const bookButton = form.querySelector('button[type="submit"]');
+            bookButton.disabled = true;
+            bookButton.textContent = "Booking...";
+
+            try {
+                // 1. Get the latest trip data to be safe
+                const tripRef = doc(db, `/artifacts/${appId}/public/data/trips`, tripId);
+                const tripSnap = await getDoc(tripRef);
+
+                if (!tripSnap.exists()) {
+                    throw new Error("This trip no longer exists.");
+                }
+                
+                const tripData = tripSnap.data();
+                const currentAvailableSeats = tripData.availableSeats;
+                
+                if (seatsToBook > currentAvailableSeats) {
+                     throw new Error(`Someone just booked! Only ${currentAvailableSeats} seats are left.`);
+                }
+                
+                // 2. Create the booking document
+                await addDoc(getBookingsCollection(), {
+                    tripId: tripId,
+                    passengerId: userId,
+                    passengerName: passengerName,
+                    seatsBooked: seatsToBook,
+                    status: "Confirmed",
+                    bookedAt: Timestamp.now()
+                });
+                
+                // 3. Update the available seats on the trip
+                const newAvailableSeats = currentAvailableSeats - seatsToBook;
+                await updateDoc(tripRef, {
+                    availableSeats: newAvailableSeats
+                });
+                
+                // Success
+                alert("Ride booked successfully!");
+                closeModal('book-ride-modal');
+                form.reset();
+
+            } catch (error) {
+                console.error("Error booking ride:", error);
+                alert("Error: " + error.message);
+            } finally {
+                bookButton.disabled = false;
+                bookButton.textContent = "Confirm Booking";
+            }
+        }
+
+        // --- DRIVER FUNCTIONS ---
+        function listenForMyTrips() {
+            console.log("Listening for my trips...");
+            myTripsContainer.innerHTML = '<p class="text-gray-500">Loading your posted rides...</p>';
+
+            const q = query(
+                getTripsCollection(),
+                where("driverId", "==", userId)
+            );
+
+            myTripsListener = onSnapshot(q, (snapshot) => {
+                if (snapshot.empty) {
+                    myTripsContainer.innerHTML = '<p class="text-gray-500">You have not posted any rides.</p>';
+                    return;
+                }
+
+                let trips = [];
+                snapshot.forEach(doc => {
+                    trips.push({ id: doc.id, ...doc.data() });
+                });
+                
+                // Sort by departure time (earliest first)
+                trips.sort((a, b) => a.departureTime.seconds - b.departureTime.seconds);
+
+                renderMyTrips(trips);
+
+            }, (error) => {
+                console.error("Error listening for my trips:", error);
+                myTripsContainer.innerHTML = '<p class="text-red-500">Error loading your rides.</p>';
+            });
+        }
+        
+        function renderMyTrips(trips) {
+            myTripsContainer.innerHTML = ''; // Clear previous
+            trips.forEach(trip => {
+                const tripCard = document.createElement('div');
+                tripCard.className = "bg-white shadow-md rounded-lg p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between space-y-3 sm:space-y-0";
+                
+                const departure = trip.departureTime.toDate();
+                const timeString = departure.toLocaleDateString() + ' @ ' + departure.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+                const seatsBooked = trip.totalSeats - trip.availableSeats;
+                let statusColor = "text-green-600";
+                if (trip.status === "Cancelled") statusColor = "text-red-600";
+                if (trip.departureTime.toMillis() < Date.now()) statusColor = "text-gray-500";
+
+                tripCard.innerHTML = `
+                    <div class="flex-1">
+                        <div class="flex items-center space-x-3">
+                            <span class="font-bold text-lg text-blue-600">${trip.origin}</span>
+                            <span class="text-gray-500">&rarr;</span>
+                            <span class="font-bold text-lg text-blue-600">${trip.destination}</span>
+                        </div>
+                        <p class="text-sm text-gray-600">${trip.vehicleType} on ${timeString}</p>
+                        <p class="text-sm font-semibold ${statusColor}">${trip.status}</p>
+                    </div>
+                    <div class="flex sm:flex-col sm:items-end sm:text-right">
+                        <p class="text-lg font-bold">${seatsBooked} / ${trip.totalSeats} <span class="text-sm font-normal text-gray-600">seats booked</span></p>
+                        <button data-trip-id="${trip.id}" class="view-bookings-btn ml-4 sm:ml-0 sm:mt-2 w-full sm:w-auto px-4 py-2 bg-gray-500 text-white rounded-lg shadow hover:bg-gray-600 transition duration-150">
+                            View Bookings
+                        </button>
+                    </div>
+                `;
+                myTripsContainer.appendChild(tripCard);
+            });
+            
+            // Add event listeners
+            myTripsContainer.querySelectorAll('.view-bookings-btn').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    const tripId = e.currentTarget.dataset.tripId;
+                    showViewBookingsModal(tripId);
+                });
+            });
+        }
+        
+        function showViewBookingsModal(tripId) {
+            viewBookingsList.innerHTML = '<p class="text-gray-500">Loading bookings...</p>';
+            viewBookingsModal.classList.remove('hidden');
+
+            // Detach previous listener if any
+            if (myBookingsListener) myBookingsListener();
+            
+            const q = query(
+                getBookingsCollection(),
+                where("tripId", "==", tripId)
+            );
+            
+            myBookingsListener = onSnapshot(q, (snapshot) => {
+                if (snapshot.empty) {
+                    viewBookingsList.innerHTML = '<p class="text-gray-500">No bookings for this ride yet.</p>';
+                    return;
+                }
+                
+                viewBookingsList.innerHTML = ''; // Clear
+                let totalSeats = 0;
+                snapshot.forEach(doc => {
+                    const booking = doc.data();
+                    const li = document.createElement('li');
+                    li.className = "flex justify-between items-center py-2 border-b";
+                    li.innerHTML = `
+                        <span>${booking.passengerName}</span>
+                        <span class="font-semibold">${booking.seatsBooked} seat(s)</span>
+                    `;
+                    viewBookingsList.appendChild(li);
+                    totalSeats += booking.seatsBooked;
+                });
+                
+                // Add a summary
+                const summary = document.createElement('li');
+                summary.className = "flex justify-between items-center pt-2 font-bold text-lg";
+                summary.innerHTML = `
+                    <span>Total Booked</span>
+                    <span>${totalSeats} seats</span>
+                `;
+                viewBookingsList.appendChild(summary);
+                
+            }, (error) => {
+                console.error("Error fetching bookings:", error);
+                viewBookingsList.innerHTML = '<p class="text-red-500">Error loading bookings.</p>';
+            });
+        }
+        
+        async function handlePostRide(e) {
+            e.preventDefault();
+            if (!userId) return;
+
+            const form = e.target;
+            const postButton = form.querySelector('button[type="submit"]');
+            
+            // Get form data
+            const driverName = document.getElementById('driver-name').value;
+            const vehicleType = document.getElementById('vehicle-type').value;
+            const origin = document.getElementById('origin').value;
+            const destination = document.getElementById('destination').value;
+            const departureDateTime = document.getElementById('departure-time').value;
+            const totalSeats = parseInt(document.getElementById('total-seats').value, 10);
+            const pricePerSeat = parseInt(document.getElementById('price').value, 10);
+            
+            // Validation
+            if (origin === destination) {
+                alert("Origin and Destination cannot be the same.");
+                return;
+            }
+            if (!driverName || !departureDateTime || !totalSeats || !pricePerSeat) {
+                 alert("Please fill out all fields.");
+                return;
+            }
+            if (new Date(departureDateTime) < new Date()) {
+                alert("Departure time must be in the future.");
+                return;
+            }
+            
+            postButton.disabled = true;
+            postButton.textContent = "Posting...";
+
+            try {
+                // Convert date string to Firebase Timestamp
+                const departureTimestamp = Timestamp.fromDate(new Date(departureDateTime));
+
+                await addDoc(getTripsCollection(), {
+                    driverId: userId,
+                    driverName: driverName,
+                    vehicleType: vehicleType,
+                    origin: origin,
+                    destination: destination,
+                    departureTime: departureTimestamp,
+                    totalSeats: totalSeats,
+                    availableSeats: totalSeats, // Initially, all seats are available
+                    pricePerSeat: pricePerSeat,
+                    status: "Scheduled", // 'Scheduled', 'Departed', 'Cancelled'
+                    createdAt: Timestamp.now()
+                });
+                
+                // Success
+                alert("Ride posted successfully!");
+                closeModal('post-ride-modal');
+                form.reset();
+
+            } catch (error) {
+                console.error("Error posting ride:", error);
+                alert("Error: Could not post ride.");
+            } finally {
+                postButton.disabled = false;
+                postButton.textContent = "Post This Ride";
+            }
+        }
+        
+        // --- MODAL UTILITIES ---
+        function showModal(modalId) {
+            document.getElementById(modalId).classList.remove('hidden');
+        }
+
+        function closeModal(modalId) {
+            document.getElementById(modalId).classList.add('hidden');
+            // If we are closing the view bookings modal, detach the listener
+            if (modalId === 'view-bookings-modal' && myBookingsListener) {
+                myBookingsListener();
+                myBookingsListener = null;
+            }
+        }
+        
+        // --- POPULATE SELECTS ---
+        function populateSelect(selectId, options) {
+            const select = document.getElementById(selectId);
+            options.forEach(option => {
+                const el = document.createElement('option');
+                el.value = option;
+                el.textContent = option;
+                select.appendChild(el);
+            });
+        }
+
+        // --- ONLOAD ---
+        window.onload = () => {
+            // Assign DOM elements
+            passengerView = document.getElementById('passenger-view');
+            driverView = document.getElementById('driver-view');
+            loadingSpinner = document.getElementById('loading-spinner');
+            authStatus = document.getElementById('auth-status');
+            userIdDisplay = document.getElementById('user-id-display');
+            postRideModal = document.getElementById('post-ride-modal');
+            bookRideModal = document.getElementById('book-ride-modal');
+            viewBookingsModal = document.getElementById('view-bookings-modal');
+            allTripsContainer = document.getElementById('all-trips-container');
+            myTripsContainer = document.getElementById('my-trips-container');
+            viewBookingsList = document.getElementById('view-bookings-list');
+            
+            // Populate dropdowns
+            populateSelect('origin', CITIES);
+            populateSelect('destination', CITIES);
+            populateSelect('vehicle-type', VEHICLES);
+
+            // Attach core event listeners
+            document.getElementById('passenger-tab').addEventListener('click', () => toggleView('passenger'));
+            document.getElementById('driver-tab').addEventListener('click', () => toggleView('driver'));
+            
+            document.getElementById('show-post-ride-modal-btn').addEventListener('click', () => showModal('post-ride-modal'));
+            
+            document.getElementById('post-ride-form').addEventListener('submit', handlePostRide);
+            document.getElementById('book-ride-form').addEventListener('submit', handleBookRide);
+            
+            // Modal close buttons
+            document.querySelectorAll('.modal-close-btn').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    const modalId = e.currentTarget.closest('.modal-container').id;
+                    closeModal(modalId);
+                });
+            });
+            
+            // Start Firebase
+            initFirebase();
+        };
+    </script>
+    <style>
+        /* Simple spinner */
+        .spinner {
+            border-top-color: #3498db;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body class="font-sans antialiased">
+
+    <!-- Loading Spinner Overlay -->
+    <div id="loading-spinner" class="fixed inset-0 bg-white bg-opacity-75 flex items-center justify-center z-50">
+        <div class="spinner w-12 h-12 rounded-full border-4 border-gray-200"></div>
+    </div>
+
+    <!-- Main Container -->
+    <div class="container mx-auto max-w-4xl p-4 min-h-screen">
+        
+        <!-- Header -->
+        <header class="mb-4">
+            <div class="flex flex-col sm:flex-row justify-between sm:items-center">
+                <h1 class="text-3xl font-bold text-blue-700">Chalo Connect</h1>
+                <div class="text-xs text-gray-500 mt-2 sm:mt-0 sm:text-right">
+                    <span id="user-id-display">Your User ID: (Initializing...)</span><br>
+                    <span>Status: <b id="auth-status" class="text-yellow-500">Initializing...</b></span>
+                </div>
+            </div>
+            <p class="text-md text-gray-600">Your local ride-sharing service for Van, Eeco & Ertiga.</p>
+        </header>
+
+        <!-- View Toggler -->
+        <div class="mb-4">
+            <div class="flex w-full rounded-lg shadow p-1 bg-gray-200">
+                <button id="passenger-tab" class="w-1/2 p-2 rounded-lg font-semibold bg-blue-600 text-white transition-all">
+                    I'm a Passenger
+                </button>
+                <button id="driver-tab" class="w-1/2 p-2 rounded-lg font-semibold bg-white transition-all">
+                    I'm a Driver
+                </button>
+            </div>
+        </div>
+
+        <!-- Passenger View -->
+        <div id="passenger-view" class="">
+            <div class="bg-white p-4 rounded-lg shadow mb-4">
+                <h2 class="text-xl font-semibold text-gray-800 mb-2">Find a Ride</h2>
+                <p class="text-gray-600">See all available rides below. New rides will appear automatically.</p>
+            </div>
+            
+            <div id="all-trips-container" class="space-y-4">
+                <!-- Trips will be dynamically injected here by JS -->
+                <p class="text-gray-500">Loading available rides...</p>
+            </div>
+        </div>
+
+        <!-- Driver View -->
+        <div id="driver-view" class="hidden">
+            <div class="bg-white p-4 rounded-lg shadow mb-4 flex justify-between items-center">
+                <h2 class="text-xl font-semibold text-gray-800">Your Posted Rides</h2>
+                <button id="show-post-ride-modal-btn" class="px-4 py-2 bg-blue-600 text-white rounded-lg shadow hover:bg-blue-700 transition duration-150">
+                    + Post New Ride
+                </button>
+            </div>
+
+            <div id="my-trips-container" class="space-y-4">
+                <!-- Driver's trips will be injected here -->
+                <p class="text-gray-500">Loading your posted rides...</p>
+            </div>
+        </div>
+
+    </div> <!-- End Main Container -->
+
+    
+    <!-- === MODALS === -->
+
+    <!-- Post Ride Modal (for Driver) -->
+    <div id="post-ride-modal" class="modal-container hidden fixed inset-0 bg-gray-900 bg-opacity-50 flex items-center justify-center z-40 p-4">
+        <div class="bg-white rounded-lg shadow-xl w-full max-w-lg p-6 relative">
+            <button class="modal-close-btn absolute top-3 right-3 text-gray-400 hover:text-gray-600 text-2xl">&times;</button>
+            <h3 class="text-2xl font-semibold mb-4">Post a New Ride</h3>
+            
+            <form id="post-ride-form" class="space-y-4">
+                <div>
+                    <label for="driver-name" class="block text-sm font-medium text-gray-700">Your Name</label>
+                    <input type="text" id="driver-name" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500">
+                </div>
+                
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                        <label for="vehicle-type" class="block text-sm font-medium text-gray-700">Vehicle Type</label>
+                        <select id="vehicle-type" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 bg-white">
+                            <!-- Options populated by JS -->
+                        </select>
+                    </div>
+                    <div>
+                        <label for="total-seats" class="block text-sm font-medium text-gray-700">Total Seats Available</label>
+                        <input type="number" id="total-seats" min="1" max="20" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500" value="6">
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                        <label for="origin" class="block text-sm font-medium text-gray-700">From</label>
+                        <select id="origin" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 bg-white">
+                            <!-- Options populated by JS -->
+                        </select>
+                    </div>
+                    <div>
+                        <label for="destination" class="block text-sm font-medium text-gray-700">To</label>
+                        <select id="destination" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 bg-white">
+                            <!-- Options populated by JS -->
+                        </select>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                        <label for="departure-time" class="block text-sm font-medium text-gray-700">Departure Time</label>
+                        <input type="datetime-local" id="departure-time" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500">
+                    </div>
+                    <div>
+                        <label for="price" class="block text-sm font-medium text-gray-700">Price per Seat (₹)</label>
+                        <input type="number" id="price" min="0" step="10" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500" placeholder="e.g., 200">
+                    </div>
+                </div>
+                
+                <div class="pt-2">
+                    <button type="submit" class="w-full px-4 py-2 bg-blue-600 text-white rounded-lg shadow hover:bg-blue-700 transition duration-150 font-semibold">
+                        Post This Ride
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+    
+    <!-- Book Ride Modal (for Passenger) -->
+    <div id="book-ride-modal" class="modal-container hidden fixed inset-0 bg-gray-900 bg-opacity-50 flex items-center justify-center z-40 p-4">
+        <div class="bg-white rounded-lg shadow-xl w-full max-w-md p-6 relative">
+            <button class="modal-close-btn absolute top-3 right-3 text-gray-400 hover:text-gray-600 text-2xl">&times;</button>
+            <h3 class="text-2xl font-semibold mb-4">Book Your Seat(s)</h3>
+            
+            <form id="book-ride-form" class="space-y-4" data-trip-id="" data-max-seats="">
+                <div>
+                    <label for="book-name" class="block text-sm font-medium text-gray-700">Your Name</label>
+                    <input type="text" id="book-name" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500" placeholder="Enter your name">
+                </div>
+                <div>
+                    <label for="book-seats" class="block text-sm font-medium text-gray-700">How many seats?</label>
+                    <input type="number" id="book-seats" min="1" value="1" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500">
+                </div>
+                <div class="pt-2">
+                    <button type="submit" class="w-full px-4 py-2 bg-green-500 text-white rounded-lg shadow hover:bg-green-600 transition duration-150 font-semibold">
+                        Confirm Booking
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+    
+    <!-- View Bookings Modal (for Driver) -->
+    <div id="view-bookings-modal" class="modal-container hidden fixed inset-0 bg-gray-900 bg-opacity-50 flex items-center justify-center z-40 p-4">
+        <div class="bg-white rounded-lg shadow-xl w-full max-w-md p-6 relative">
+            <button class="modal-close-btn absolute top-3 right-3 text-gray-400 hover:text-gray-600 text-2xl">&times;</button>
+            <h3 class="text-2xl font-semibold mb-4">Passenger List</h3>
+            
+            <ul id="view-bookings-list" class="space-y-2">
+                <!-- Bookings will be dynamically injected here -->
+                <p class="text-gray-500">Loading bookings...</p>
+            </ul>
+        </div>
+    </div>
+
+</body>
+</html>
